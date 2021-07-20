@@ -10,14 +10,19 @@ import torch.nn.functional as F
 from tqdm import tqdm, trange
 
 import matplotlib.pyplot as plt
-
+"""
 from run_nerf_helpers import *
-
 from load_llff import load_llff_data
 from load_deepvoxels import load_dv_data
 from load_blender import load_blender_data
 from load_LINEMOD import load_LINEMOD_data
-
+"""
+from .run_nerf_helpers import *
+from .load_llff import load_llff_data
+from .load_deepvoxels import load_dv_data
+from .load_blender import load_blender_data
+from .load_LINEMOD import load_LINEMOD_data
+from .preprocessing import *
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 np.random.seed(0)
@@ -528,6 +533,9 @@ def config_parser():
     parser.add_argument("--i_video",   type=int, default=50000, 
                         help='frequency of render_poses video saving')
 
+
+    parser.add_argument("--preprocess", type=bool, default=False,
+                        help='Preprocess the images for experiments')
     return parser
 
 
@@ -607,6 +615,8 @@ def train():
         print('Unknown dataset type', args.dataset_type, 'exiting')
         return
 
+    if args.preprocess:
+        preprocessing(images)
     # Cast intrinsics to right types
     H, W, focal = hwf
     H, W = int(H), int(W)
