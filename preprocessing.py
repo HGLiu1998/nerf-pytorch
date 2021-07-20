@@ -4,4 +4,5 @@ import torchvision.transforms
 import torchvision.models
 
 
-def preprocessing()
+def preprocessing():
+    pass
