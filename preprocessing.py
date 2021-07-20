@@ -3,5 +3,5 @@ import torch.nn as nn
 import torchvision.models
 
 
-def preprocessing():
-    pass
+def preprocessing(imgs):
+    print(imgs.shape)
