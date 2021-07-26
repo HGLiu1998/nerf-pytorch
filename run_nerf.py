@@ -13,12 +13,12 @@ import matplotlib.pyplot as plt
 
 import sys,os
 sys.path.append(os.getcwd())
-from nerf_pytorch import run_nerf_helpers
+from nerf_pytorch.run_nerf_helpers import *
 from nerf_pytorch.load_llff import load_llff_data
 from nerf_pytorch.load_deepvoxels import load_dv_data
 from nerf_pytorch.load_blender import load_blender_data
 from nerf_pytorch.load_LINEMOD import load_LINEMOD_data
-from nerf_pytorch import preprocessing
+from nerf_pytorch.preprocessing import *
 """
 from run_nerf_helpers import *
 from load_llff import load_llff_data
@@ -540,6 +540,7 @@ def config_parser():
 
     parser.add_argument("--preprocess", type=bool, default=False,
                         help='Preprocess the images for experiments')
+    parser.add_argument("--N_iter", type=int, default=200000)
     return parser
 
 
@@ -620,7 +621,8 @@ def train():
         return
 
     if args.preprocess:
-        preprocessing(images)
+        print("Preprocessing")
+        images = preprocessing(images)
     # Cast intrinsics to right types
     H, W, focal = hwf
     H, W = int(H), int(W)
