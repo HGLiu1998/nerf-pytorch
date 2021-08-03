@@ -4,14 +4,19 @@ import imageio
 import json
 import random
 import time
+from numpy.lib.type_check import imag
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm, trange
 
-import matplotlib.pyplot as plt
+import cv2
+from skimage import img_as_ubyte
 
+import matplotlib.pyplot as plt
+from collections import OrderedDict
 import sys,os
+
 sys.path.append(os.getcwd())
 from nerf_pytorch.run_nerf_helpers import *
 from nerf_pytorch.load_llff import load_llff_data
@@ -19,6 +24,9 @@ from nerf_pytorch.load_deepvoxels import load_dv_data
 from nerf_pytorch.load_blender import load_blender_data
 from nerf_pytorch.load_LINEMOD import load_LINEMOD_data
 from nerf_pytorch.preprocessing import *
+from Deblurring.MPRNet import MPRNet
+
+
 """
 from run_nerf_helpers import *
 from load_llff import load_llff_data
@@ -623,6 +631,50 @@ def train():
     if args.preprocess:
         print("Preprocessing")
         images = preprocessing(images)
+
+
+    def load_checkpoint(model, weights):
+        checkpoint = torch.load(weights)
+        try:
+            model.load_state_dict(checkpoint["state_dict"])
+        except:
+            state_dict = checkpoint["state_dict"]
+            new_state_dict = OrderedDict()
+            for k, v in state_dict.items():
+                name = k[7:] # remove `module.`
+                new_state_dict[name] = v
+            model.load_state_dict(new_state_dict)
+
+    print("Run Deblurring")
+    model = MPRNet().cuda()
+    weights = 'model_deblurring.pth'
+    load_checkpoint(model, weights)
+    model.eval()
+    img_multiple_of = 8
+    for i in range(images.shape[0]):
+        img = torch.Tensor(images[i]).permute(2,0,1).unsqueeze(0).cuda()
+        print(img.shape)
+        h,w = img.shape[2], img.shape[3]
+        H,W = ((h+img_multiple_of)//img_multiple_of)*img_multiple_of, ((w+img_multiple_of)//img_multiple_of)*img_multiple_of
+        padh = H-h if h%img_multiple_of!=0 else 0
+        padw = W-w if w%img_multiple_of!=0 else 0
+        img = F.pad(img, (0,padw,0,padh), 'reflect')
+
+        with torch.no_grad():
+            restored = model(img)
+        
+        restored = restored[0]
+        restored = torch.clamp(restored, 0, 1)
+        restored = restored[:,:,:h,:w]
+
+        restored = restored.permute(0, 2, 3, 1).cpu().detach().squeeze(0).numpy()
+        images[i] = restored
+        restored = img_as_ubyte(restored)
+        cv2.imwrite('deblurred_img.png', cv2.cvtColor(restored, cv2.COLOR_RGB2BGR))
+   
+    print("Done!")
+    return
+
     # Cast intrinsics to right types
     H, W, focal = hwf
     H, W = int(H), int(W)
