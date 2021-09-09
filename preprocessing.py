@@ -6,25 +6,53 @@ import torchvision.transforms as tranforms
 import cv2
 import numpy as np
 from torchvision.transforms import transforms
+import random
 
-to8b = lambda x : (255*np.clip(x,0,1)).astype(np.uint8)
+gaussain_t = transforms.Compose([
+    transforms.ToPILImage(),
+    transforms.GaussianBlur(kernel_size=51, sigma=10),
+])
 
+inpainting_t = transforms.Compose([
+    transforms.ToPILImage(),
+])
 
-def preprocessing(imgs):
+toPIL_t = transforms.Compose([
+    transforms.ToPILImage(),
+])
+
+def preprocessing(imgs, p_type):
     for i in range(imgs.shape[0]):
+        
         image = torch.Tensor(imgs[i])
         image = image.permute((2,0,1))
-        t = transforms.Compose([
-            transforms.ToPILImage(),
-            transforms.GaussianBlur(kernel_size=51, sigma=2),
-            #transforms.GaussianBlur((51,51))
-        ])
+        #image = imgs[i]
+        print(image.shape)
+
+        if p_type == 'Guassian':
+            image = gaussain_t(image)
+        elif p_type == 'Noise':
+            image = torch.clip(image + torch.randn(image.shape) * 0.2 + 0.0, 0,1)
+            image = toPIL_t(image)
+        elif p_type == 'Inpainting':
+            mask = torch.ones_like(image)
+            mask_h, mask_w = int(image.shape[1] / 4), int(image.shape[2] / 4)
+            x = random.randint(0, int(image.shape[1]-mask_h/2))
+            y = random.randint(0, int(image.shape[2]-mask_w/2))
+            mask[:, x:x+mask_h, y:mask_w+y] = 0
+            image = image * mask
+            image = toPIL_t(image)
+        else:
+            print("Not defined type")
+            image = toPIL_t(image)
+
+
         reverse_t = transforms.ToTensor()   
-        image = t(image)
 
         print('save png')
-        image.save('51-2.png')
+        image.save('preprcessed.png')
         image = reverse_t(image).permute((1, 2, 0)).numpy()
+        print(image.shape)
         imgs[i] = image
     return imgs
 

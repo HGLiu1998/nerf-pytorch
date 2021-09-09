@@ -26,6 +26,8 @@ from nerf_pytorch.load_LINEMOD import load_LINEMOD_data
 from nerf_pytorch.preprocessing import *
 from Deblurring.MPRNet import MPRNet
 
+import logging
+
 
 """
 from run_nerf_helpers import *
@@ -140,6 +142,7 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
         rays = torch.cat([rays, viewdirs], -1)
 
     # Render and reshape
+    # batchify_rays run the modelo and render each pixels(rays) of the image
     all_ret = batchify_rays(rays, chunk, **kwargs)
     for k in all_ret:
         k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
@@ -195,7 +198,7 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
 def create_nerf(args):
     """Instantiate NeRF's MLP model.
     """
-    embed_fn, input_ch = get_embedder(args.multires, args.i_embed)
+    embed_fn, input_ch = get_embedder(args.multires, args.i_embed) # positional encoding
 
     input_ch_views = 0
     embeddirs_fn = None
@@ -548,6 +551,8 @@ def config_parser():
 
     parser.add_argument("--preprocess", type=bool, default=False,
                         help='Preprocess the images for experiments')
+    parser.add_argument("--process_type", type=str, default='Guassian',
+                        help='Sepcific preprocess type')
     parser.add_argument("--N_iter", type=int, default=200000)
     return parser
 
@@ -556,7 +561,7 @@ def train():
 
     parser = config_parser()
     args = parser.parse_args()
-
+    logging.basicConfig(filename=f'./training_{args.expname}.log', level=logging.INFO)
     # Load data
     K = None
     if args.dataset_type == 'llff':
@@ -565,6 +570,7 @@ def train():
                                                                   spherify=args.spherify)
         hwf = poses[0,:3,-1]
         poses = poses[:,:3,:4]
+        print(f"images_shape:{images.shape}, poses_shape:{poses.shape}")
         print('Loaded llff', images.shape, render_poses.shape, hwf, args.datadir)
         if not isinstance(i_test, list):
             i_test = [i_test]
@@ -630,9 +636,9 @@ def train():
 
     if args.preprocess:
         print("Preprocessing")
-        images = preprocessing(images)
+        images = preprocessing(images, args.process_type)
 
-
+    
     def load_checkpoint(model, weights):
         checkpoint = torch.load(weights)
         try:
@@ -644,7 +650,10 @@ def train():
                 name = k[7:] # remove `module.`
                 new_state_dict[name] = v
             model.load_state_dict(new_state_dict)
-
+    
+    #Deblur model
+    """
+    print(i_train)
     print("Run Deblurring")
     model = MPRNet().cuda()
     weights = 'model_deblurring.pth'
@@ -653,7 +662,6 @@ def train():
     img_multiple_of = 8
     for i in range(images.shape[0]):
         img = torch.Tensor(images[i]).permute(2,0,1).unsqueeze(0).cuda()
-        print(img.shape)
         h,w = img.shape[2], img.shape[3]
         H,W = ((h+img_multiple_of)//img_multiple_of)*img_multiple_of, ((w+img_multiple_of)//img_multiple_of)*img_multiple_of
         padh = H-h if h%img_multiple_of!=0 else 0
@@ -673,7 +681,7 @@ def train():
         cv2.imwrite('deblurred_img.png', cv2.cvtColor(restored, cv2.COLOR_RGB2BGR))
    
     print("Done!")
-    return
+    """
 
     # Cast intrinsics to right types
     H, W, focal = hwf
@@ -825,11 +833,14 @@ def train():
                 target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
 
         #####  Core optimization loop  #####
+        # render_kwargs_train contains run_network function and model 
         rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
                                                 verbose=i < 10, retraw=True,
                                                 **render_kwargs_train)
 
         optimizer.zero_grad()
+        
+        ### Loss define ###
         img_loss = img2mse(rgb, target_s)
         trans = extras['raw'][...,-1]
         loss = img_loss
@@ -895,6 +906,7 @@ def train():
     
         if i%args.i_print==0:
             tqdm.write(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()}")
+            logging.info(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()}")
         """
             print(expname, i, psnr.numpy(), loss.numpy(), global_step.numpy())
             print('iter time {:.05f}'.format(dt))
