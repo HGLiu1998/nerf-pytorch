@@ -24,10 +24,9 @@ from nerf_pytorch.load_deepvoxels import load_dv_data
 from nerf_pytorch.load_blender import load_blender_data
 from nerf_pytorch.load_LINEMOD import load_LINEMOD_data
 from nerf_pytorch.preprocessing import *
-from Deblurring.MPRNet import MPRNet
+#from Deblurring.MPRNet import MPRNet
 
 import logging
-
 
 """
 from run_nerf_helpers import *
@@ -42,6 +41,15 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 np.random.seed(0)
 DEBUG = False
 
+def set_random_seed(seed=9922008):
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
 
 def batchify(fn, chunk):
     """Constructs a version of 'fn' that applies to smaller batches.
@@ -554,11 +562,13 @@ def config_parser():
     parser.add_argument("--process_type", type=str, default='Guassian',
                         help='Sepcific preprocess type')
     parser.add_argument("--N_iter", type=int, default=200000)
+    parser.add_argument("--fixed_random_seed", type=bool, default=False,
+                        help='set random seed to reproduce training results.')
     return parser
 
 
 def train():
-
+    set_random_seed()
     parser = config_parser()
     args = parser.parse_args()
     logging.basicConfig(filename=f'./training_{args.expname}.log', level=logging.INFO)
@@ -636,7 +646,8 @@ def train():
 
     if args.preprocess:
         print("Preprocessing")
-        images = preprocessing(images, args.process_type)
+        images, masks = preprocessing(images, args.process_type)
+        #rint(images.shape, masks.shape)
 
     
     def load_checkpoint(model, weights):
@@ -841,6 +852,7 @@ def train():
         optimizer.zero_grad()
         
         ### Loss define ###
+        print(rgb.shape, target_s.shape, masks.shape)
         img_loss = img2mse(rgb, target_s)
         trans = extras['raw'][...,-1]
         loss = img_loss
