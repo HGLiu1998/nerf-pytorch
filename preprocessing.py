@@ -38,6 +38,8 @@ def preprocessing(imgs, mode):
             p_type = mode
 
 
+        
+
         if p_type == 'Blur':
             image = Image.open(blur_imgs[i])
             
@@ -46,9 +48,9 @@ def preprocessing(imgs, mode):
             image = toPIL_t(image)
         elif p_type == 'Inpainting':
             mask = torch.ones_like(image)
-            mask_h, mask_w = int(image.shape[1] / 4), int(image.shape[2] / 4)
-            x = random.randint(0, int(image.shape[1]-mask_h/2))
-            y = random.randint(0, int(image.shape[2]-mask_w/2))
+            mask_h, mask_w = int(image.shape[1] / 2), int(image.shape[2] / 2)
+            x = int(image.shape[1] / 4)
+            y = int(image.shape[2] / 4)
             mask[:, x:x+mask_h, y:mask_w+y] = 0
             image = image * mask
             image = toPIL_t(image)    

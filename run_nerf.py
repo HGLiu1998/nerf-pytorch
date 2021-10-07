@@ -817,6 +817,9 @@ def train():
             img_i = np.random.choice(i_train)
             target = images[img_i]
             target = torch.Tensor(target).to(device)
+            if args.preprocess == True:
+                mask = masks[img_i]
+                mask = torch. Tensor(mask).to(device)
             pose = poses[img_i, :3,:4]
 
             if N_rand is not None:
@@ -842,18 +845,20 @@ def train():
                 rays_d = rays_d[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
                 batch_rays = torch.stack([rays_o, rays_d], 0)
                 target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
+                if args.preprocess == True:
+                    mask_s = mask[select_coords[:, 0], select_coords[:, 1]]
 
         #####  Core optimization loop  #####
         # render_kwargs_train contains run_network function and model 
         rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
                                                 verbose=i < 10, retraw=True,
                                                 **render_kwargs_train)
-
         optimizer.zero_grad()
         
         ### Loss define ###
-        print(rgb.shape, target_s.shape, masks.shape)
-        img_loss = img2mse(rgb, target_s)
+        #print(rgb.shape, target_s.shape, masks.shape)
+        
+        img_loss = img2mse(rgb * mask_s, target_s)
         trans = extras['raw'][...,-1]
         loss = img_loss
         psnr = mse2psnr(img_loss)
