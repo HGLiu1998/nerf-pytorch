@@ -10,9 +10,6 @@ from torchvision.transforms import transforms
 import random
 import os
 
-blur_path = './nerf_pytorch/data/nerf_llff_data/horns/images_8_random'
-blur_imgs = [os.path.join(blur_path, f) for f in sorted(os.listdir(blur_path))]
-
 gaussain_t = transforms.Compose([
     transforms.ToPILImage(),
     transforms.GaussianBlur(kernel_size=51, sigma=10),
@@ -25,47 +22,54 @@ inpainting_t = transforms.Compose([
 toPIL_t = transforms.Compose([
     transforms.ToPILImage(),
 ])
+toTensor = tranforms.Compose([
+    tranforms.ToTensor(),
+])
 
-def preprocessing(imgs, mode):
+def preprocessing(imgs, datadir, using_mask=True):
+    mask_path = datadir + '/images_8_mask2'
+    mask_imgs = [os.path.join(mask_path, f) for f in sorted(os.listdir(mask_path))]
     masks = []
+    i_train = [i for i in range(imgs.shape[0])]
+    for i in i_train:
+        if(i % 8 == 0):
+            i_train.remove(i)
+    #i_train.remove(1)
+
+    
     for i in range(imgs.shape[0]):
         
         image = torch.Tensor(imgs[i])
         image = image.permute((2,0,1))
-        if mode == 'Random':
-            p_type = random.choice(["Blur", "Noise", "Inpainting"])
+        mask = torch.ones_like(image)
+
+        if i in i_train:
+            if using_mask == True:
+                m_img = Image.open(mask_imgs[i])
+                m_img = toTensor(m_img).cuda()
+                mask = m_img[:3, :, :]
+                image = image * mask
+                image = toPIL_t(image)
+            else:
+                mask = torch.ones_like(image)
+                mask_h, mask_w = int(image.shape[1] / 4), int(image.shape[2] / 4)
+                
+                x = random.randint(0, int(image.shape[1] - image.shape[1]/4))
+                y = random.randint(0, int(image.shape[2] - image.shape[2]/4))
+                mask[:, x:x+mask_h, y:mask_w+y] = 0
+                image = image * mask
+                image = toPIL_t(image)      
         else:
-            p_type = mode
-
-
-        
-
-        if p_type == 'Blur':
-            image = Image.open(blur_imgs[i])
-            
-        elif p_type == 'Noise':
-            image = torch.clip(image + torch.randn(image.shape) * 0.2 + 0.0, 0,1)
+            print("Not in training set")
             image = toPIL_t(image)
-        elif p_type == 'Inpainting':
-            mask = torch.ones_like(image)
-            mask_h, mask_w = int(image.shape[1] / 2), int(image.shape[2] / 2)
-            x = int(image.shape[1] / 4)
-            y = int(image.shape[2] / 4)
-            mask[:, x:x+mask_h, y:mask_w+y] = 0
-            image = image * mask
-            image = toPIL_t(image)    
-            masks.append(torch.Tensor(mask).unsqueeze(0))
-        else:
-            print("Not defined type")
-            image = toPIL_t(image)
-
 
         reverse_t = transforms.ToTensor()
-
         print('save png')
         image.save('./preprocess/preprcessed_{}.png'.format(i))
         image = reverse_t(image).permute((1, 2, 0)).numpy()
         print(image.shape)
         imgs[i] = image
+        masks.append(torch.Tensor(mask).unsqueeze(0))
+
     masks = torch.cat(masks, 0).permute(0, 2, 3, 1)
     return imgs, masks

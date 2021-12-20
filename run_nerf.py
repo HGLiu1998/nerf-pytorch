@@ -1,4 +1,5 @@
 import os, sys
+#from typing_extensions import Required
 import numpy as np
 import imageio
 import json
@@ -8,6 +9,11 @@ from numpy.lib.type_check import imag
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.autograd import Variable
+from torch.autograd import grad as torch_grad
+from torch.serialization import save
+from torchvision.transforms.transforms import RandomOrder
+from torchvision.utils import save_image
 from tqdm import tqdm, trange
 
 import cv2
@@ -24,6 +30,7 @@ from nerf_pytorch.load_deepvoxels import load_dv_data
 from nerf_pytorch.load_blender import load_blender_data
 from nerf_pytorch.load_LINEMOD import load_LINEMOD_data
 from nerf_pytorch.preprocessing import *
+from nerf_pytorch.patchnet import *
 #from Deblurring.MPRNet import MPRNet
 
 import logging
@@ -558,12 +565,12 @@ def config_parser():
 
 
     parser.add_argument("--preprocess", type=bool, default=False,
-                        help='Preprocess the images for experiments')
-    parser.add_argument("--process_type", type=str, default='Guassian',
-                        help='Sepcific preprocess type')
+                        help='Load mask to preprocess the images ')
     parser.add_argument("--N_iter", type=int, default=200000)
     parser.add_argument("--fixed_random_seed", type=bool, default=False,
                         help='set random seed to reproduce training results.')
+    parser.add_argument("--prior", type=bool, default=False)
+    parser.add_argument("--usePatch", type=bool, default=False)
     return parser
 
 
@@ -646,7 +653,8 @@ def train():
 
     if args.preprocess:
         print("Preprocessing")
-        images, masks = preprocessing(images, args.process_type)
+        origin_imgs = images
+        images, masks = preprocessing(images, args.datadir)
         #rint(images.shape, masks.shape)
 
     
@@ -661,38 +669,6 @@ def train():
                 name = k[7:] # remove `module.`
                 new_state_dict[name] = v
             model.load_state_dict(new_state_dict)
-    
-    #Deblur model
-    """
-    print(i_train)
-    print("Run Deblurring")
-    model = MPRNet().cuda()
-    weights = 'model_deblurring.pth'
-    load_checkpoint(model, weights)
-    model.eval()
-    img_multiple_of = 8
-    for i in range(images.shape[0]):
-        img = torch.Tensor(images[i]).permute(2,0,1).unsqueeze(0).cuda()
-        h,w = img.shape[2], img.shape[3]
-        H,W = ((h+img_multiple_of)//img_multiple_of)*img_multiple_of, ((w+img_multiple_of)//img_multiple_of)*img_multiple_of
-        padh = H-h if h%img_multiple_of!=0 else 0
-        padw = W-w if w%img_multiple_of!=0 else 0
-        img = F.pad(img, (0,padw,0,padh), 'reflect')
-
-        with torch.no_grad():
-            restored = model(img)
-        
-        restored = restored[0]
-        restored = torch.clamp(restored, 0, 1)
-        restored = restored[:,:,:h,:w]
-
-        restored = restored.permute(0, 2, 3, 1).cpu().detach().squeeze(0).numpy()
-        images[i] = restored
-        restored = img_as_ubyte(restored)
-        cv2.imwrite('deblurred_img.png', cv2.cvtColor(restored, cv2.COLOR_RGB2BGR))
-   
-    print("Done!")
-    """
 
     # Cast intrinsics to right types
     H, W, focal = hwf
@@ -708,7 +684,7 @@ def train():
 
     if args.render_test:
         render_poses = np.array(poses[i_test])
-
+    
     # Create log dir and copy the config file
     basedir = args.basedir
     expname = args.expname
@@ -723,6 +699,9 @@ def train():
         with open(f, 'w') as file:
             file.write(open(args.config, 'r').read())
 
+    # Create patchnet
+    D = PatchNet(3)
+    D_optimizer = torch.optim.Adam(D.parameters(), lr=2e-4, betas=(0.5, 0.999))
     # Create nerf model
     render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf(args)
     global_step = start
@@ -785,7 +764,7 @@ def train():
         rays_rgb = torch.Tensor(rays_rgb).to(device)
 
 
-    N_iters = 200000 + 1
+    N_iters = args.N_iter + 1
     print('Begin')
     print('TRAIN views are', i_train)
     print('TEST views are', i_test)
@@ -793,7 +772,8 @@ def train():
 
     # Summary writers
     # writer = SummaryWriter(os.path.join(basedir, 'summaries', expname))
-    
+    if args.prior:
+        print("Using prior")
     start = start + 1
     for i in trange(start, N_iters):
         time0 = time.time()
@@ -838,13 +818,27 @@ def train():
                 else:
                     coords = torch.stack(torch.meshgrid(torch.linspace(0, H-1, H), torch.linspace(0, W-1, W)), -1)  # (H, W, 2)
 
-                coords = torch.reshape(coords, [-1,2])  # (H * W, 2)
-                select_inds = np.random.choice(coords.shape[0], size=[N_rand], replace=False)  # (N_rand,)
-                select_coords = coords[select_inds].long()  # (N_rand, 2)
-                rays_o = rays_o[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
-                rays_d = rays_d[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
-                batch_rays = torch.stack([rays_o, rays_d], 0)
-                target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
+                #coords = torch.reshape(coords, [-1,2])  # (H * W, 2)
+                if not args.usePatch:
+                    coords = torch.reshape(coords, [-1, 2])
+                    select_inds = np.random.choice(coords.shape[0], size=[N_rand], replace=False)  # (N_rand,)
+                    select_coords = coords[select_inds].long()  # (N_rand, 2)
+                    rays_o = rays_o[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
+                    rays_d = rays_d[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
+                    batch_rays = torch.stack([rays_o, rays_d], 0)
+                    target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
+                # Using patch-like ray sampling for training of discriminator 
+                else:
+                    patch_size = (32,32)
+                    x = random.randint(0, coords.shape[0] - 32)
+                    y = random.randint(0, coords.shape[0] - 32)
+                    select_coords = coords[x:x+32,y:y+32].long() #(32, 32, 2)
+                    select_coords = torch.reshape(select_coords, [-1, 2])
+                    rays_o = rays_o[select_coords[:, 0], select_coords[:, 1]]  
+                    rays_d = rays_d[select_coords[:, 0], select_coords[:, 1]]  
+                    batch_rays = torch.stack([rays_o, rays_d], 0)
+                    target_s = target[select_coords[:, 0], select_coords[:, 1]]
+                    
                 if args.preprocess == True:
                     mask_s = mask[select_coords[:, 0], select_coords[:, 1]]
 
@@ -853,12 +847,56 @@ def train():
         rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
                                                 verbose=i < 10, retraw=True,
                                                 **render_kwargs_train)
+        #target_img = origin_imgs[img_i]
+        #with torch.no_grad():
+        #    rgbs, disps = render_path(torch.Tensor(poses[img_i]).to(device), hwf, K, args.chunk, render_kwargs_test, gt_imgs=target_img)
+        render_kwargs_train['network_fn'].eval()
+        render_kwargs_train['network_fine'].eval()
+        D.train()
+        D_optimizer.zero_grad()
+        target_patch = torch.reshape(target_s, (32, 32, -1)).permute(2,1,0).unsqueeze(0)
+        output_patch = torch.reshape(rgb, (32, 32, -1)).permute(2,1,0).unsqueeze(0)
+        save_image(target_patch[0], "Target_patch.png")
+        save_image(output_patch[0], "Output_patch.png")
+        D_fake = D(output_patch).cuda()
+        D_real = D(target_patch).cuda()
+        ## gradient panalty
+        print(D_fake,D_real)
+        a = torch.rand(target_patch.shape)
+        noise_patch = a * target_patch + (1 - a) * output_patch
+        noise_patch = Variable(noise_patch, requires_grad=True)
+        D_noise = D(noise_patch)
+        gradient = torch_grad(outputs=D_noise, inputs=noise_patch, grad_outputs=torch.ones(D_noise.size()).cuda(), create_graph=True, retain_graph=True)[0]
+        gradient = gradient.view(1,-1)
+
+        gradient_norm = gradient.norm(2, dim=1)
+
+        #   loss = w_loss + self.lambda_ * gp 
+        d_loss = D_fake.mean() - D_real.mean() + 10 * ((gradient_norm - 1) ** 2).mean()
+        d_loss.backward()
+        D_optimizer.step()
+        #print(f"D_loss:{loss}")
+    
+        ### Loss define && Train NeRF###
+        #print(rgb.shape, target_s.shape, masks.shape)
+        rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
+                                                verbose=i < 10, retraw=True,
+                                                **render_kwargs_train)
+
+        D.eval()
+        render_kwargs_train['network_fn'].train()
+        render_kwargs_train['network_fine'].train()
+        output_patch = torch.reshape(rgb, (32, 32, -1)).permute(2,1,0).unsqueeze(0)
+        D_fake = D(output_patch)
         optimizer.zero_grad()
         
-        ### Loss define ###
-        #print(rgb.shape, target_s.shape, masks.shape)
+        if args.prior:
+            #print("Using prior")
+            img_loss = img2mse(rgb * mask_s, target_s) - 0.1 * D_fake.mean()
+        else:
+            img_loss = img2mse(rgb, target_s)
         
-        img_loss = img2mse(rgb * mask_s, target_s)
+        #print(rgb.shape, mask_s.shape, target_s.shape)
         trans = extras['raw'][...,-1]
         loss = img_loss
         psnr = mse2psnr(img_loss)
@@ -918,6 +956,8 @@ def train():
             with torch.no_grad():
                 render_path(torch.Tensor(poses[i_test]).to(device), hwf, K, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir)
             print('Saved test set')
+
+            origin_imgs[i_test]
 
 
     
