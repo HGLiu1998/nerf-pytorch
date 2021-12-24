@@ -7,8 +7,6 @@ import torch.nn as nn
 import numpy as np
 
 
-
-
 class PatchNet(nn.Module):
     def __init__(self, input_size, ndf=64, isPatch=False):
         super(PatchNet, self).__init__()
@@ -42,23 +40,23 @@ class Discriminator(nn.Module):
     def __init__(self, input_size, ndf=64):
         super(Discriminator, self).__init__()
         self.k, self.s, self.p = 4, 2, 1
-        self.layers = 2
+        self.layers = 3
         self.net = [
-            nn.Conv2d(input_size, ndf, self.k, self.s, self.p, bias=False),
+            nn.Conv2d(input_size, ndf, self.k, self.s, self.p), 
             nn.LeakyReLU(0.2, True),
         ]
-  
 
         for i in range(self.layers):
             self.net += [
-                nn.Conv2d(ndf * (2**(i)), ndf * (2**(i+1)), self.k, self.s, self.p, bias=False),
-                nn.BatchNorm2d(ndf * (2 ** (i+1))),
+                nn.Conv2d(ndf * (2**(i)), ndf * (2**(i+1)), self.k, self.s, self.p),
+                nn.InstanceNorm2d(ndf * (2 ** (i+1))),
                 nn.LeakyReLU(0.2, True)
             ]
             if i == self.layers - 1:
                 self.net += [
-                    nn.Conv2d(ndf * (2**(i+1)), 1, self.k, 1, 0, bias=False),
+                    nn.Conv2d(ndf * (2**(i+1)), ndf * (2**(i+2)), self.s, self.k, self.p),
                     nn.Flatten(),
+                    nn.Linear(1024, 1),
                     nn.Sigmoid()
                 ]
         self.net = nn.Sequential(*self.net)

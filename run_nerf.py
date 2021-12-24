@@ -571,6 +571,7 @@ def config_parser():
                         help='set random seed to reproduce training results.')
     parser.add_argument("--prior", type=bool, default=False)
     parser.add_argument("--usePatch", type=bool, default=False)
+    parser.add_argument("--D_iter", type=int, default=1000)
     return parser
 
 
@@ -700,7 +701,8 @@ def train():
             file.write(open(args.config, 'r').read())
 
     # Create patchnet
-    D = PatchNet(3)
+    D = Discriminator(3)
+    print(D)
     D_optimizer = torch.optim.Adam(D.parameters(), lr=2e-4, betas=(0.5, 0.999))
     # Create nerf model
     render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf(args)
@@ -777,7 +779,108 @@ def train():
     start = start + 1
     for i in trange(start, N_iters):
         time0 = time.time()
+        """
+        render_kwargs_train['network_fn'].eval()
+        render_kwargs_train['network_fine'].eval()
+        D.train()
+        ##Discriminator update
+        D_loss = []
+        for j in range(args.D_iter):
+            if use_batching:
+                # Random over all images
+                batch = rays_rgb[i_batch:i_batch+N_rand] # [B, 2+1, 3*?]
+                batch = torch.transpose(batch, 0, 1)
+                batch_rays, target_s = batch[:2], batch[2]
 
+                i_batch += N_rand
+                if i_batch >= rays_rgb.shape[0]:
+                    print("Shuffle data after an epoch!")
+                    rand_idx = torch.randperm(rays_rgb.shape[0])
+                    rays_rgb = rays_rgb[rand_idx]
+                    i_batch = 0
+
+            else:
+                # Random from one image
+                img_i = np.random.choice(i_train)
+                target = images[img_i]
+                target = torch.Tensor(target).to(device)
+                if args.preprocess == True:
+                    mask = masks[img_i]
+                    mask = torch. Tensor(mask).to(device)
+                pose = poses[img_i, :3,:4]
+
+                if N_rand is not None:
+                    rays_o, rays_d = get_rays(H, W, K, torch.Tensor(pose))  # (H, W, 3), (H, W, 3)
+
+                    if i < args.precrop_iters:
+                        dH = int(H//2 * args.precrop_frac)
+                        dW = int(W//2 * args.precrop_frac)
+                        coords = torch.stack(
+                            torch.meshgrid(
+                                torch.linspace(H//2 - dH, H//2 + dH - 1, 2*dH), 
+                                torch.linspace(W//2 - dW, W//2 + dW - 1, 2*dW)
+                            ), -1)
+                        if i == start:
+                            print(f"[Config] Center cropping of size {2*dH} x {2*dW} is enabled until iter {args.precrop_iters}")                
+                    else:
+                        coords = torch.stack(torch.meshgrid(torch.linspace(0, H-1, H), torch.linspace(0, W-1, W)), -1)  # (H, W, 2)
+
+                    #coords = torch.reshape(coords, [-1,2])  # (H * W, 2)
+                    if not args.usePatch:
+                        coords = torch.reshape(coords, [-1, 2])
+                        select_inds = np.random.choice(coords.shape[0], size=[N_rand], replace=False)  # (N_rand,)
+                        select_coords = coords[select_inds].long()  # (N_rand, 2)
+                        rays_o = rays_o[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
+                        rays_d = rays_d[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
+                        batch_rays = torch.stack([rays_o, rays_d], 0)
+                        target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
+                    # Using patch-like ray sampling for training of discriminator 
+                    else:
+                        patch_size = (32,32)
+                        x = random.randint(0, coords.shape[0] - 32)
+                        y = random.randint(0, coords.shape[1] - 32)
+                        select_coords = coords[x:x+32,y:y+32].long() #(32, 32, 2)
+                        select_coords = torch.reshape(select_coords, [-1, 2])
+                        rays_o = rays_o[select_coords[:, 0], select_coords[:, 1]]  
+                        rays_d = rays_d[select_coords[:, 0], select_coords[:, 1]]  
+                        batch_rays = torch.stack([rays_o, rays_d], 0)
+                        target_s = target[select_coords[:, 0], select_coords[:, 1]]
+                        
+                    if args.preprocess == True:
+                        mask_s = mask[select_coords[:, 0], select_coords[:, 1]]
+            
+            rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
+                                                    verbose=i < 10, retraw=True,
+                                                    **render_kwargs_train)
+            #target_img = origin_imgs[img_i]
+            #with torch.no_grad():
+            #    rgbs, disps = render_path(torch.Tensor(poses[img_i]).to(device), hwf, K, args.chunk, render_kwargs_test, gt_imgs=target_img)
+            
+            D_optimizer.zero_grad()
+            target_patch = torch.reshape(target_s, (32, 32, -1)).permute(2,1,0).unsqueeze(0)
+            output_patch = torch.reshape(rgb, (32, 32, -1)).permute(2,1,0).unsqueeze(0)
+            save_image(target_patch[0], "Target_patch.png")
+            save_image(output_patch[0], "Output_patch.png")
+            D_fake = D(output_patch).cuda()
+            D_real = D(target_patch).cuda()
+            ## gradient panalty
+            print(D_fake,D_real)
+            a = torch.rand(target_patch.shape)
+            noise_patch = a * target_patch + (1 - a) * output_patch
+            noise_patch = Variable(noise_patch, requires_grad=True)
+            D_noise = D(noise_patch)
+            gradient = torch_grad(outputs=D_noise, inputs=noise_patch, grad_outputs=torch.ones(D_noise.size()).cuda(), create_graph=True, retain_graph=True)[0]
+            gradient = gradient.view(1,-1)
+
+            #gradient_norm = gradient.norm(2, dim=1)
+            gradient_norm = torch.sqrt(torch.sum(gradient ** 2, dim=1) + 1e-12)
+            #   loss = w_loss + self.lambda_ * gp 
+            d_loss = D_fake.mean() - D_real.mean() + 10 * ((gradient_norm - 1) ** 2).mean()
+            D_loss.append(d_loss)
+            d_loss.backward()
+            D_optimizer.step()
+        print(f"D_loss:{sum(D_loss)/len(D_loss)}")
+        """
         # Sample random ray batch
         if use_batching:
             # Random over all images
@@ -831,7 +934,7 @@ def train():
                 else:
                     patch_size = (32,32)
                     x = random.randint(0, coords.shape[0] - 32)
-                    y = random.randint(0, coords.shape[0] - 32)
+                    y = random.randint(0, coords.shape[1] - 32)
                     select_coords = coords[x:x+32,y:y+32].long() #(32, 32, 2)
                     select_coords = torch.reshape(select_coords, [-1, 2])
                     rays_o = rays_o[select_coords[:, 0], select_coords[:, 1]]  
@@ -844,39 +947,8 @@ def train():
 
         #####  Core optimization loop  #####
         # render_kwargs_train contains run_network function and model 
-        rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
-                                                verbose=i < 10, retraw=True,
-                                                **render_kwargs_train)
-        #target_img = origin_imgs[img_i]
-        #with torch.no_grad():
-        #    rgbs, disps = render_path(torch.Tensor(poses[img_i]).to(device), hwf, K, args.chunk, render_kwargs_test, gt_imgs=target_img)
-        render_kwargs_train['network_fn'].eval()
-        render_kwargs_train['network_fine'].eval()
-        D.train()
-        D_optimizer.zero_grad()
-        target_patch = torch.reshape(target_s, (32, 32, -1)).permute(2,1,0).unsqueeze(0)
-        output_patch = torch.reshape(rgb, (32, 32, -1)).permute(2,1,0).unsqueeze(0)
-        save_image(target_patch[0], "Target_patch.png")
-        save_image(output_patch[0], "Output_patch.png")
-        D_fake = D(output_patch).cuda()
-        D_real = D(target_patch).cuda()
-        ## gradient panalty
-        print(D_fake,D_real)
-        a = torch.rand(target_patch.shape)
-        noise_patch = a * target_patch + (1 - a) * output_patch
-        noise_patch = Variable(noise_patch, requires_grad=True)
-        D_noise = D(noise_patch)
-        gradient = torch_grad(outputs=D_noise, inputs=noise_patch, grad_outputs=torch.ones(D_noise.size()).cuda(), create_graph=True, retain_graph=True)[0]
-        gradient = gradient.view(1,-1)
-
-        gradient_norm = gradient.norm(2, dim=1)
-
-        #   loss = w_loss + self.lambda_ * gp 
-        d_loss = D_fake.mean() - D_real.mean() + 10 * ((gradient_norm - 1) ** 2).mean()
-        d_loss.backward()
-        D_optimizer.step()
-        #print(f"D_loss:{loss}")
     
+        
         ### Loss define && Train NeRF###
         #print(rgb.shape, target_s.shape, masks.shape)
         rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
@@ -886,13 +958,16 @@ def train():
         D.eval()
         render_kwargs_train['network_fn'].train()
         render_kwargs_train['network_fine'].train()
-        output_patch = torch.reshape(rgb, (32, 32, -1)).permute(2,1,0).unsqueeze(0)
-        D_fake = D(output_patch)
+        #output_patch = torch.reshape(rgb, (32, 32, -1)).permute(2,1,0).unsqueeze(0)
+        #save_image(output_patch[0], "NeRF_Patch.png")
+
+        #D_fake = D(output_patch)
         optimizer.zero_grad()
         
         if args.prior:
             #print("Using prior")
-            img_loss = img2mse(rgb * mask_s, target_s) - 0.1 * D_fake.mean()
+            #img_loss = img2mse(rgb * mask_s, target_s) - 0.1 * D_fake.mean()
+            img_loss = img2mse(rgb * mask_s, target_s)
         else:
             img_loss = img2mse(rgb, target_s)
         
