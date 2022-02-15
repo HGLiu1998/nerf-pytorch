@@ -1,4 +1,6 @@
 import os, sys
+from select import select
+from re import M
 #from typing_extensions import Required
 import numpy as np
 import imageio
@@ -31,7 +33,6 @@ from nerf_pytorch.load_blender import load_blender_data
 from nerf_pytorch.load_LINEMOD import load_LINEMOD_data
 from nerf_pytorch.preprocessing import *
 from nerf_pytorch.Discriminator import *
-from nerf_pytorch.loss import *
 #from Deblurring.MPRNet import MPRNet
 
 import logging
@@ -655,9 +656,9 @@ def train():
 
     if args.preprocess:
         print("Preprocessing")
-        origin_imgs = images.copy()
-        images, masks = preprocessing(images, args.datadir)
-        #rint(images.shape, masks.shape)
+        #origin_imgs = images.copy()
+        images, masks, origin_imgs = preprocessing(images, args.datadir)
+        print(images.shape, masks.shape, origin_imgs.shape)
 
     
     def load_checkpoint(model, weights):
@@ -701,6 +702,13 @@ def train():
         with open(f, 'w') as file:
             file.write(open(args.config, 'r').read())
 
+    # Create patchnet
+    #D = Discriminator(3)
+    D = VGGDiscriminator()
+
+    print(D)
+    D_optimizer = torch.optim.Adam(D.parameters(), lr=4e-4, betas=(0.9, 0.999))
+    D_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(D_optimizer, 'min')
     # Create nerf model
     render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf(args)
     global_step = start
@@ -771,12 +779,126 @@ def train():
 
     # Summary writers
     # writer = SummaryWriter(os.path.join(basedir, 'summaries', expname))
+    #Get each mask coordiante
+    maskCoords = []
+    for i in range(images.shape[0]):
+        mask = masks[i]
+        mask = torch.Tensor(mask)
+        mask_coords = []
+        for h in range(H):
+            for w in range(W):
+                if not torch.equal(mask[h, w, :], torch.Tensor([1,1,1])):
+                    mask_coords.append(torch.FloatTensor([h, w]).unsqueeze(0))
+        mask_coords = torch.cat(mask_coords, 0)
+        maskCoords.append(mask_coords)
+
     if args.prior:
         print("Using prior")
     start = start + 1
     for i in trange(start, N_iters):
         time0 = time.time()
+        
+        #"""
+        if i >= 0:
+            D.train()
+            D_optimizer.zero_grad()
+            render_kwargs_train['network_fn'].eval()
+            render_kwargs_train['network_fine'].eval()
+            ##Discriminator update
+            D_loss = []
+            for k in range(args.D_iter):
+                # Prepare data
+                img_i = np.random.choice(i_train)
+                target = origin_imgs[img_i] #non-masked image
+                target = torch.Tensor(target).to(device)
+                
+                #save_image(target[0], "original_img.png")
+                if args.preprocess == True:
+                    mask = masks[img_i]
+                    mask = torch.Tensor(mask).to(device)
+                pose = poses[img_i, :3,:4]
+                
+                if N_rand is not None:
+                    rays_o, rays_d = get_rays(H, W, K, torch.Tensor(pose))  # (H, W, 3), (H, W, 3)
 
+                    if i < args.precrop_iters:
+                        dH = int(H//2 * args.precrop_frac)
+                        dW = int(W//2 * args.precrop_frac)
+                        coords = torch.stack(
+                            torch.meshgrid(
+                                torch.linspace(H//2 - dH, H//2 + dH - 1, 2*dH), 
+                                torch.linspace(W//2 - dW, W//2 + dW - 1, 2*dW)
+                            ), -1)
+                        if i == start:
+                            print(f"[Config] Center cropping of size {2*dH} x {2*dW} is enabled until iter {args.precrop_iters}")                
+                    else:
+                        coords = torch.stack(torch.meshgrid(torch.linspace(0, H-1, H), torch.linspace(0, W-1, W)), -1)  # (H, W, 2)
+
+                    #coords = torch.reshape(coords, [-1,2])  # (H * W, 2)
+                    mask_coords = maskCoords[img_i]
+                    
+                    #Get real patch
+                    x = random.randint(16, coords.shape[0] - 16)
+                    y = random.randint(16, coords.shape[1] - 16)
+                    select_coords = coords[x-16:x+16, y-16:y+16].long() #(32, 32, 2)
+                    select_coords = torch.reshape(select_coords, [-1, 2])
+                    target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
+                        
+                    #Get fake patch
+                    select_inds = np.random.choice(mask_coords.shape[0], replace=False)  # (N_rand,)
+                    x = mask_coords[select_inds][0].int()
+                    y = mask_coords[select_inds][1].int()
+                    x = max(min(x, coords.shape[0] - 16), 16)
+                    y = max(min(y, coords.shape[1] - 16), 16)
+                    #print(x,y)
+                    select_coords = coords[x-16:x+16, y-16:y+16].long() #(32, 32, 2)
+                    select_coords = torch.reshape(select_coords, [-1, 2])
+                    rays_o = rays_o[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
+                    rays_d = rays_d[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
+                    batch_rays = torch.stack([rays_o, rays_d], 0)
+
+                rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays, verbose=i < 10, retraw=True, **render_kwargs_train)
+                real = torch.reshape(target_s, (32, 32, -1)).detach().permute(2, 1, 0).unsqueeze(0)
+                fake = torch.reshape(rgb, (32, 32, -1)).detach().permute(2,1,0).unsqueeze(0)
+                save_image(real[0], "real.png")
+                save_image(fake[0], "fake.png")
+                #fake_img = target
+                #for c in range(N_rand):
+                #    fake_img[select_coords[c][0]][select_coords[c][1]] = rgb[c]
+                #print(fake_img.shape, rgb.shape)
+                #target = target.permute(2, 1, 0).unsqueeze(0)
+                #fake_img = fake_img.permute(2,1,0).unsqueeze(0)
+
+                D_real = D(real).cuda()
+                D_fake = D(fake).cuda()
+                ## gradient panalty
+                print(D_fake,D_real)
+                a = torch.rand(1,1,1,1)
+                a = a.expand_as(real).cuda()
+                noise_patch = (a * real.data + (1 - a) * fake.data)
+                noise_patch = Variable(noise_patch, requires_grad=True).cuda()
+                #noise_patch = Variable(noise_patch, requires_grad=True)
+                D_noise = D(noise_patch)
+                gradient = torch_grad(outputs=D_noise, inputs=noise_patch, grad_outputs=torch.ones(D_noise.size()).cuda(), create_graph=True, retain_graph=True)[0]
+                #gradient = gradient.view(1,-1)
+
+                gradient = gradient.view(1,-1)
+                #gradient_norm = gradient.norm(2, dim=1)
+                gradient_norm = torch.sqrt(torch.sum(gradient ** 2, dim=1) + 1e-12)
+                #   loss = w_loss + self.lambda_ * gp 
+                d_loss = D_fake.mean() - D_real.mean() + 10 * ((gradient_norm - 1) ** 2).mean()
+                #d_loss = -torch.log(D_real) + torch.log(D_fake)
+                D_loss.append(d_loss)
+                
+                d_loss.backward()
+                #D_optimizer.step()
+                D_scheduler.step(d_loss)
+            #print(f"D_loss:{sum(D_loss)/len(D_loss)}")
+            #"""
+        
+        D.eval()
+        render_kwargs_train['network_fn'].train()
+        render_kwargs_train['network_fine'].train()
         # Sample random ray batch
         if use_batching:
             # Random over all images
@@ -794,10 +916,10 @@ def train():
         else:
             # Random from one image
             img_i = np.random.choice(i_train)
-            target_origin = origin_imgs[img_i]
+            #target_o = origin_imgs[img_i]
             target = images[img_i]
-            target_origin = torch.Tensor(target_origin).to(device)
             target = torch.Tensor(target).to(device)
+
             if args.preprocess == True:
                 mask = masks[img_i]
                 mask = torch.Tensor(mask).to(device)
@@ -820,6 +942,7 @@ def train():
                     coords = torch.stack(torch.meshgrid(torch.linspace(0, H-1, H), torch.linspace(0, W-1, W)), -1)  # (H, W, 2)
 
                 #coords = torch.reshape(coords, [-1,2])  # (H * W, 2)
+                #if not args.usePatch or i < 200000:
                 if not args.usePatch:
                     coords = torch.reshape(coords, [-1, 2])
                     select_inds = np.random.choice(coords.shape[0], size=[N_rand], replace=False)  # (N_rand,)
@@ -828,10 +951,8 @@ def train():
                     rays_d = rays_d[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
                     batch_rays = torch.stack([rays_o, rays_d], 0)
                     target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
-                    target_o = target_origin[select_coords[:, 0], select_coords[:, 1]]
                 # Using patch-like ray sampling for training of discriminator 
                 else:
-                    patch_size = (32,32)
                     x = random.randint(16, coords.shape[0] - 16)
                     y = random.randint(16, coords.shape[1] - 16)
                     select_coords = coords[x-16:x+16, y-16:y+16].long() #(32, 32, 2)
@@ -840,7 +961,6 @@ def train():
                     rays_d = rays_d[select_coords[:, 0], select_coords[:, 1]]  
                     batch_rays = torch.stack([rays_o, rays_d], 0)
                     target_s = target[select_coords[:, 0], select_coords[:, 1]]
-                    target_o = target_origin[select_coords[:, 0], select_coords[:, 1]]
                     
                 if args.preprocess == True:
                     mask_s = mask[select_coords[:, 0], select_coords[:, 1]]
@@ -848,26 +968,43 @@ def train():
         #####  Core optimization loop  #####
         # render_kwargs_train contains run_network function and model 
     
-        perceptualloss = PerceptualLoss()
+        
         ### Loss define && Train NeRF###
         #print(rgb.shape, target_s.shape, masks.shape)
         rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
                                                 verbose=i < 10, retraw=True,
                                                 **render_kwargs_train)
+        # Patch
+        if i >= 0:
+            masked_patch = torch.reshape(target_s, (32, 32, -1)).permute(2, 1, 0).unsqueeze(0)
+            mask = torch.reshape(mask_s, (32, 32, -1)).permute(2,1,0).unsqueeze(0)
+            output_patch = torch.reshape(rgb, (32, 32, -1)).permute(2,1,0).unsqueeze(0)
+        #save_image(output_patch[0], "NeRF_Patch.png")
+        #print(mask.shape, masked_patch.shape, output_patch.shape)
+        
+        #fake_img = target
+        #for c in range(N_rand):
+            #fake_img[select_coords[c][0]][select_coords[c][1]] = rgb[c]
+        #print(fake_img.shape, rgb.shape)
+        #fake_img = fake_img.permute(2,1,0).unsqueeze(0)
 
-        masked_patch = torch.reshape(target_s, (32, 32, -1)).permute(2, 1, 0).unsqueeze(0)
-        original_patch = torch.reshape(target_o, (32, 32, -1)).permute(2, 1, 0).unsqueeze(0)
-        mask = torch.reshape(mask_s, (32, 32, -1)).permute(2,1,0).unsqueeze(0)
-        output_patch = torch.reshape(rgb, (32, 32, -1)).permute(2,1,0).unsqueeze(0)
-        compose_patch = (output_patch * (1-mask) + masked_patch * mask)
+
+            D_fake = D(output_patch*(1-mask) + masked_patch * mask) #[0~1]
+
+            print(D_fake.mean())
         optimizer.zero_grad()
         
         if args.prior:
-            p_loss = perceptualloss(compose_patch, original_patch)
-            mse_loss = img2mse(rgb * mask_s, target_s)
-            img_loss = mse_loss + p_loss
-            print(mse_loss)
-            print(p_loss)
+            #print("Using prior")
+            # Suppose patch didn't have mask region
+            # D_fake.mean() should be 1
+            # loss = img2mse(rgb, target_s) - 1
+            # suppose 
+            if i >= 0:
+                img_loss = img2mse(rgb * mask_s, target_s) - 0.01 * D_fake.mean()
+                print("Using Discriminator_Loss")
+            else:
+                img_loss = img2mse(rgb * mask_s, target_s)
         else:
             img_loss = img2mse(rgb, target_s)
         
@@ -891,6 +1028,7 @@ def train():
         new_lrate = args.lrate * (decay_rate ** (global_step / decay_steps))
         for param_group in optimizer.param_groups:
             param_group['lr'] = new_lrate
+     
         ################################
 
         dt = time.time()-time0
