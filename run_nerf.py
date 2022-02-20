@@ -31,7 +31,7 @@ from nerf_pytorch.load_blender import load_blender_data
 from nerf_pytorch.load_LINEMOD import load_LINEMOD_data
 from nerf_pytorch.preprocessing import *
 from nerf_pytorch.Discriminator import *
-from nerf_pytorch.loss import *
+from nerf_pytorch.utils import *
 #from Deblurring.MPRNet import MPRNet
 
 import logging
@@ -655,8 +655,8 @@ def train():
 
     if args.preprocess:
         print("Preprocessing")
-        origin_imgs = images.copy()
-        images, masks = preprocessing(images, args.datadir)
+        #origin_imgs = images.copy()
+        images, masks, origin_imgs = preprocessing(images, args.datadir)
         #rint(images.shape, masks.shape)
 
     
@@ -848,26 +848,24 @@ def train():
         #####  Core optimization loop  #####
         # render_kwargs_train contains run_network function and model 
     
-        perceptualloss = PerceptualLoss()
+        #perceptualloss = PerceptualLoss()
         ### Loss define && Train NeRF###
         #print(rgb.shape, target_s.shape, masks.shape)
         rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
                                                 verbose=i < 10, retraw=True,
                                                 **render_kwargs_train)
 
-        masked_patch = torch.reshape(target_s, (32, 32, -1)).permute(2, 1, 0).unsqueeze(0)
-        original_patch = torch.reshape(target_o, (32, 32, -1)).permute(2, 1, 0).unsqueeze(0)
-        mask = torch.reshape(mask_s, (32, 32, -1)).permute(2,1,0).unsqueeze(0)
-        output_patch = torch.reshape(rgb, (32, 32, -1)).permute(2,1,0).unsqueeze(0)
-        compose_patch = (output_patch * (1-mask) + masked_patch * mask)
+        #masked_patch = torch.reshape(target_s, (32, 32, -1)).permute(2, 1, 0).unsqueeze(0)
+        #original_patch = torch.reshape(target_o, (32, 32, -1)).permute(2, 1, 0).unsqueeze(0)
+        #mask = torch.reshape(mask_s, (32, 32, -1)).permute(2,1,0).unsqueeze(0)
+        #output_patch = torch.reshape(rgb, (32, 32, -1)).permute(2,1,0).unsqueeze(0)
+        #compose_patch = (output_patch * (1-mask) + masked_patch * mask)
         optimizer.zero_grad()
         
         if args.prior:
-            p_loss = perceptualloss(compose_patch, original_patch)
             mse_loss = img2mse(rgb * mask_s, target_s)
-            img_loss = mse_loss + p_loss
-            print(mse_loss)
-            print(p_loss)
+            img_loss = mse_loss 
+            #print(mse_loss)
         else:
             img_loss = img2mse(rgb, target_s)
         
@@ -877,7 +875,10 @@ def train():
         psnr = mse2psnr(img_loss)
 
         if 'rgb0' in extras:
-            img_loss0 = img2mse(extras['rgb0'], target_s)
+            if args.prior:
+                img_loss0 = img2mse(extras['rgb0'] * mask_s, target_s)
+            else: 
+                img_loss0 = img2mse(extras['rgb0'], target_s)
             loss = loss + img_loss0
             psnr0 = mse2psnr(img_loss0)
 

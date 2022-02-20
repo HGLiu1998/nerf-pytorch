@@ -1,3 +1,4 @@
+from email import utils
 import os, sys
 from select import select
 from re import M
@@ -33,6 +34,7 @@ from nerf_pytorch.load_blender import load_blender_data
 from nerf_pytorch.load_LINEMOD import load_LINEMOD_data
 from nerf_pytorch.preprocessing import *
 from nerf_pytorch.Discriminator import *
+from nerf_pytorch.utils import *
 #from Deblurring.MPRNet import MPRNet
 
 import logging
@@ -160,6 +162,7 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
 
     # Render and reshape
     # batchify_rays run the modelo and render each pixels(rays) of the image
+    #print(rays_o.shape, rays_d.shape, rays.shape)
     all_ret = batchify_rays(rays, chunk, **kwargs)
     for k in all_ret:
         k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
@@ -574,6 +577,7 @@ def config_parser():
     parser.add_argument("--prior", type=bool, default=False)
     parser.add_argument("--usePatch", type=bool, default=False)
     parser.add_argument("--D_iter", type=int, default=1000)
+    parser.add_argument("--useGAN", type=bool, default=False)
     return parser
 
 
@@ -658,11 +662,7 @@ def train():
     if args.preprocess:
         print("Preprocessing")
         images, masks, origin_imgs= preprocessing(images, args.datadir)
-        print(images.shape, masks.shape, origin_imgs.shape)
-        save_image(torch.Tensor(images[0]).permute(0,3,1,2), "masked_image.png")
-        save_image(torch.Tensor(masks[0]).permute(0,3,1,2), "mask.png")
-        save_image(torch.Tensor(origin_imgs[0]).permute(0,3,1,2), "original_img.png")
-        return 
+        
         #rint(images.shape, masks.shape)
     
     
@@ -682,13 +682,11 @@ def train():
     H, W, focal = hwf
     H, W = int(H), int(W)
     hwf = [H, W, focal]
-
-    if K is None:
-        K = np.array([
-            [focal, 0, 0.5*W],
-            [0, focal, 0.5*H],
-            [0, 0, 1]
-        ])
+    K = np.array([
+        [focal, 0, 0.5*W],
+        [0, focal, 0.5*H],
+        [0, 0, 1]
+    ])
 
     if args.render_test:
         render_poses = np.array(poses[i_test])
@@ -708,10 +706,10 @@ def train():
             file.write(open(args.config, 'r').read())
 
     # Create patchnet
-    D = ProgressiveDiscriminator()
-    print(D)
-    D_optimizer = torch.optim.Adam(D.parameters(), lr=4e-4, betas=(0.9, 0.999))
-    D_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(D_optimizer, 'min')
+    #D = ProgressiveDiscriminator()
+    #print(D)
+    #D_optimizer = torch.optim.Adam(D.parameters(), lr=4e-4, betas=(0.9, 0.999))
+    #D_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(D_optimizer, 'min')
     # Create nerf model
     render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf(args)
     global_step = start
@@ -788,57 +786,56 @@ def train():
         print("Using prior")
     start = start + 1
 
-    progressive_iter = 40000
+    progressive_iter = {32: 10000, 64: 30000, 128: 70000, 256: 150000}
+    patch_shape = 16
+    fadein_step = 10000
     cur_shape = 32
     discriminator_step = 0
-
+    print(f"Current size: {cur_shape}")
     H = cur_shape
     W = cur_shape
+    hwf = [H, W, focal]
     K = np.array([
         [focal, 0, 0.5*W],
         [0, focal, 0.5*H],
         [0, 0, 1]
     ])
+    
+    Images, Masks, Original_images = torch.Tensor(images).cpu().detach().clone(), torch.Tensor(masks).cpu().detach().clone(), torch.Tensor(origin_imgs).cpu().detach().clone()
+    Images, Masks, Original_images = Images.permute(0,3,1,2), Masks.permute(0,3,1,2), Original_images.permute(0,3,1,2)
+    images = nn.functional.interpolate(Images, size=[cur_shape, cur_shape]).permute(0,2,3,1).cuda()
+    masks = nn.functional.interpolate(Masks, size=[cur_shape, cur_shape]).permute(0,2,3,1).cuda()
+    origin_imgs = nn.functional.interpolate(Original_images, size=[cur_shape, cur_shape]).permute(0,2,3,1).cuda()
+    print(images.shape, masks.shape, origin_imgs.shape)
 
-    maskCoords = []
-    for i in range(images.shape[0]):
-        mask = nn.functional.interpolate(masks[i], size=[cur_shape, cur_shape])
-        mask = torch.Tensor(mask)
-        mask_coords = []
-        for h in range(H):
-            for w in range(W):
-                if not torch.equal(mask[h, w, :], torch.Tensor([1,1,1])):
-                    mask_coords.append(torch.FloatTensor([h, w]).unsqueeze(0))
-        mask_coords = torch.cat(mask_coords, 0)
-        maskCoords.append(mask_coords)
-
+    if args.useGAN:
+        maskCoords = get_mask_coords(images, masks, H, W, cur_shape)
+    print("Start training")
     for i in trange(start, N_iters):
         time0 = time.time()
         
-        if i % progressive_iter == 0:
-            cur_shape * 2
+        if i % progressive_iter[cur_shape] == 0:
+            #print(i)
+            cur_shape = min(512, cur_shape*2)
+            print(f"Upsample: {cur_shape}")
             H = cur_shape
             W = cur_shape
             K = np.array([
                 [focal, 0, 0.5*W],
                 [0, focal, 0.5*H],
                 [0, 0, 1]
-            ])
-
-            maskCoords = []
-            for i in range(images.shape[0]):
-                mask = nn.functional.interpolate(masks[i], size=[cur_shape, cur_shape])
-                mask = torch.Tensor(mask)
-                mask_coords = []
-                for h in range(H):
-                    for w in range(W):
-                        if not torch.equal(mask[h, w, :], torch.Tensor([1,1,1])):
-                            mask_coords.append(torch.FloatTensor([h, w]).unsqueeze(0))
-                mask_coords = torch.cat(mask_coords, 0)
-                maskCoords.append(mask_coords)
-                
+            ]) 
+            hwf = [H, W, focal]
+            images = nn.functional.interpolate(Images, size=[cur_shape, cur_shape]).permute(0,2,3,1).cuda()
+            masks = nn.functional.interpolate(Masks, size=[cur_shape, cur_shape]).permute(0,2,3,1).cuda()
+            origin_imgs = nn.functional.interpolate(Original_images, size=[cur_shape, cur_shape]).permute(0,2,3,1).cuda()
+            #print(images.shape, masks.shape, origin_imgs.shape)
+            if args.useGAN:
+                maskCoords = get_mask_coords(images, masks, H, W, cur_shape)
+            
+        #Disciriminator trianing        
         #"""
-        if i >= 0:
+        if i >= 0 and args.useGAN:
             D.train()
             D_optimizer.zero_grad()
             render_kwargs_train['network_fn'].eval()
@@ -849,7 +846,7 @@ def train():
                 discriminator_step += 1
                 # Prepare data
                 img_i = np.random.choice(i_train)
-                target = nn.functional.interpolate(origin_imgs[img_i], size=[cur_shape, cur_shape]) #non-masked image
+                target = origin_imgs[img_i] #non-masked image
                 target = torch.Tensor(target).to(device)
                 
                 #save_image(target[0], "original_img.png")
@@ -900,14 +897,7 @@ def train():
                 rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays, verbose=i < 10, retraw=True, **render_kwargs_train)
                 real = torch.reshape(target_s, (32, 32, -1)).detach().permute(2, 1, 0).unsqueeze(0)
                 fake = torch.reshape(rgb, (32, 32, -1)).detach().permute(2,1,0).unsqueeze(0)
-                #save_image(real[0], "real2.png")
-                #save_image(fake[0], "fake2.png")
-                #fake_img = target
-                #for c in range(N_rand):
-                #    fake_img[select_coords[c][0]][select_coords[c][1]] = rgb[c]
-                #print(fake_img.shape, rgb.shape)
-                #target = target.permute(2, 1, 0).unsqueeze(0)
-                #fake_img = fake_img.permute(2,1,0).unsqueeze(0)
+        
                 alpha = min(1, discriminator_step / 10000)
                 D_real = D(real, alpha).cuda()
                 D_fake = D(fake, alpha).cuda()
@@ -936,10 +926,13 @@ def train():
             #print(f"D_loss:{sum(D_loss)/len(D_loss)}")
             #"""
         
-        D.eval()
+        # Generator training(NeRF training)
+        #D.eval()
         render_kwargs_train['network_fn'].train()
         render_kwargs_train['network_fine'].train()
+        #print(render_kwargs_train['network_fine'])
         # Sample random ray batch
+        
         if use_batching:
             # Random over all images
             batch = rays_rgb[i_batch:i_batch+N_rand] # [B, 2+1, 3*?]
@@ -957,13 +950,16 @@ def train():
             # Random from one image
             img_i = np.random.choice(i_train)
             #target_o = origin_imgs[img_i]
-            target = nn.function.interpolate(images[img_i], size=[cur_shape, cur_shape])
+            target = images[img_i]
             target = torch.Tensor(target).to(device)
 
             if args.preprocess == True:
-                mask =  nn.function.interpolate(masks[img_i], size=[cur_shape, cur_shape])
+                mask = masks[img_i]
                 mask = torch.Tensor(mask).to(device)
+                
             pose = poses[img_i, :3,:4]
+
+            print(target.shape, mask.shape)
 
             if N_rand is not None:
                 rays_o, rays_d = get_rays(H, W, K, torch.Tensor(pose))  # (H, W, 3), (H, W, 3)
@@ -984,6 +980,7 @@ def train():
                 #coords = torch.reshape(coords, [-1,2])  # (H * W, 2)
                 #if not args.usePatch or i < 200000:
                 if not args.usePatch:
+                    print("Not use Patch")
                     coords = torch.reshape(coords, [-1, 2])
                     select_inds = np.random.choice(coords.shape[0], size=[N_rand], replace=False)  # (N_rand,)
                     select_coords = coords[select_inds].long()  # (N_rand, 2)
@@ -993,13 +990,19 @@ def train():
                     target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
                 # Using patch-like ray sampling for training of discriminator 
                 else:
-                    x = random.randint(16, coords.shape[0] - 16)
-                    y = random.randint(16, coords.shape[1] - 16)
-                    select_coords = coords[x-16:x+16, y-16:y+16].long() #(32, 32, 2)
+                    pairs = np.array(fixed_coords(cur_shape, 32))
+                    print(pairs.shape)
+                    idx = np.random.choice(len(pairs), 1)
+                    x = pairs[idx, 0][0]
+                    y = pairs[idx, 1][0]
+                    print(x,y)
+                    #x = random.randint(16, H - 16)
+                    #y = random.randint(16, W - 16)
+                    select_coords = coords[x-16:x+16, y-16:y+16].long()
                     select_coords = torch.reshape(select_coords, [-1, 2])
                     rays_o = rays_o[select_coords[:, 0], select_coords[:, 1]]  
                     rays_d = rays_d[select_coords[:, 0], select_coords[:, 1]]  
-                    batch_rays = torch.stack([rays_o, rays_d], 0)
+                    batch_rays = torch.stack([rays_o, rays_d], 0) # (2, 1024, 2)
                     target_s = target[select_coords[:, 0], select_coords[:, 1]]
                     
                 if args.preprocess == True:
@@ -1007,33 +1010,51 @@ def train():
 
         #####  Core optimization loop  #####
         # render_kwargs_train contains run_network function and model 
-    
+        """
+        rgbs = []
+        img_loss = 0
+        img_loss0 = 0 #coarse mse loss
+        for p in range(int(H*W)//1024):
+            cur = (p+1) * 1024
+            #print(batch_rays[:, last:cur, :].shape)
+            print(batch_rays[:, last:cur, :].shape)
+            rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays[:, last:cur, :],
+                                                    verbose=i < 10, retraw=True,
+                                                    **render_kwargs_train)
+
+            img_loss += img2mse(rgb * mask_s[last:cur, :], target_s[last:cur, :])
+            if 'rgb0' in extras:
+                img_loss0 += img2mse(extras['rgb0'] * mask_s[last:cur, :], target_s[last:cur, :]) #coarse_mse_loss
+                psnr0 = mse2psnr(img_loss0)
+            rgbs.append(rgb)
         
-        ### Loss define && Train NeRF###
-        #print(rgb.shape, target_s.shape, masks.shape)
+        rgbs = torch.stack(rgbs).reshape(-1, 3)
+        """
         rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
-                                                verbose=i < 10, retraw=True,
-                                                **render_kwargs_train)
-        # Patch
+                                                    verbose=i < 10, retraw=True,
+                                                    **render_kwargs_train)
+        """
         if i >= 0:
             masked_patch = torch.reshape(target_s, (32, 32, -1)).permute(2, 1, 0).unsqueeze(0)
             mask = torch.reshape(mask_s, (32, 32, -1)).permute(2,1,0).unsqueeze(0)
             output_patch = torch.reshape(rgb, (32, 32, -1)).permute(2,1,0).unsqueeze(0)
 
-            D_fake = D(output_patch*(1-mask) + masked_patch * mask, 1) #[0~1]
+            save_image(masked_patch[0], "Masked_patch.png")
+            save_image(mask[0], "Mask.png")
+            save_image(output_patch[0], "Output_patch.png")
 
-            print(D_fake.mean())
+            if args.useGAN:
+                D_fake = D(output_patch*(1-mask) + masked_patch * mask, 1) #[0~1]
+
+                print(D_fake.mean())
+        """
         optimizer.zero_grad()
-        
+        # Fine loss
         if args.prior:
-            #print("Using prior")
-            # Suppose patch didn't have mask region
-            # D_fake.mean() should be 1
-            # loss = img2mse(rgb, target_s) - 1
-            # suppose 
-            if i >= 0:
+            if i >= 0 and args.useGAN:
+                print("UseGAN")
                 img_loss = img2mse(rgb * mask_s, target_s) - 0.01 * D_fake.mean()
-                print("Using Discriminator_Loss")
+                #print("Using Discriminator_Loss")
             else:
                 img_loss = img2mse(rgb * mask_s, target_s)
         else:
@@ -1041,11 +1062,11 @@ def train():
         
         #print(rgb.shape, mask_s.shape, target_s.shape)
         trans = extras['raw'][...,-1]
-        loss = img_loss
+        loss = img_loss 
         psnr = mse2psnr(img_loss)
 
         if 'rgb0' in extras:
-            img_loss0 = img2mse(extras['rgb0'], target_s)
+            img_loss0 = img2mse(extras['rgb0'] * mask_s, target_s) # Coarse Loss
             loss = loss + img_loss0
             psnr0 = mse2psnr(img_loss0)
 
@@ -1063,10 +1084,9 @@ def train():
         ################################
 
         dt = time.time()-time0
-        # print(f"Step: {global_step}, Loss: {loss}, Time: {dt}")
+        #print(f"Step: {global_step}, Loss: {loss}, Time: {dt}")
         #####           end            #####
 
-        # Rest is logging
         if i%args.i_weights==0:
             path = os.path.join(basedir, expname, '{:06d}.tar'.format(i))
             torch.save({
@@ -1098,7 +1118,7 @@ def train():
             os.makedirs(testsavedir, exist_ok=True)
             print('test poses shape', poses[i_test].shape)
             with torch.no_grad():
-                render_path(torch.Tensor(poses[i_test]).to(device), hwf, K, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir)
+                render_path(torch.Tensor(poses[i_test]).to(device), hwf, K, args.chunk, render_kwargs_test, gt_imgs=Images[i_test], savedir=testsavedir)
             print('Saved test set')
 
 
@@ -1106,48 +1126,7 @@ def train():
         if i%args.i_print==0:
             tqdm.write(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()}")
             logging.info(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()}")
-        """
-            print(expname, i, psnr.numpy(), loss.numpy(), global_step.numpy())
-            print('iter time {:.05f}'.format(dt))
-
-            with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_print):
-                tf.contrib.summary.scalar('loss', loss)
-                tf.contrib.summary.scalar('psnr', psnr)
-                tf.contrib.summary.histogram('tran', trans)
-                if args.N_importance > 0:
-                    tf.contrib.summary.scalar('psnr0', psnr0)
-
-
-            if i%args.i_img==0:
-
-                # Log a rendered validation view to Tensorboard
-                img_i=np.random.choice(i_val)
-                target = images[img_i]
-                pose = poses[img_i, :3,:4]
-                with torch.no_grad():
-                    rgb, disp, acc, extras = render(H, W, focal, chunk=args.chunk, c2w=pose,
-                                                        **render_kwargs_test)
-
-                psnr = mse2psnr(img2mse(rgb, target))
-
-                with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_img):
-
-                    tf.contrib.summary.image('rgb', to8b(rgb)[tf.newaxis])
-                    tf.contrib.summary.image('disp', disp[tf.newaxis,...,tf.newaxis])
-                    tf.contrib.summary.image('acc', acc[tf.newaxis,...,tf.newaxis])
-
-                    tf.contrib.summary.scalar('psnr_holdout', psnr)
-                    tf.contrib.summary.image('rgb_holdout', target[tf.newaxis])
-
-
-                if args.N_importance > 0:
-
-                    with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_img):
-                        tf.contrib.summary.image('rgb0', to8b(extras['rgb0'])[tf.newaxis])
-                        tf.contrib.summary.image('disp0', extras['disp0'][tf.newaxis,...,tf.newaxis])
-                        tf.contrib.summary.image('z_std', extras['z_std'][tf.newaxis,...,tf.newaxis])
-        """
-
+        
         global_step += 1
 
 

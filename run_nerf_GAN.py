@@ -704,7 +704,7 @@ def train():
 
     # Create patchnet
     #D = Discriminator(3)
-    D = VGGDiscriminator()
+    D = Discriminator()
 
     print(D)
     D_optimizer = torch.optim.Adam(D.parameters(), lr=4e-4, betas=(0.9, 0.999))
@@ -862,12 +862,6 @@ def train():
                 fake = torch.reshape(rgb, (32, 32, -1)).detach().permute(2,1,0).unsqueeze(0)
                 save_image(real[0], "real.png")
                 save_image(fake[0], "fake.png")
-                #fake_img = target
-                #for c in range(N_rand):
-                #    fake_img[select_coords[c][0]][select_coords[c][1]] = rgb[c]
-                #print(fake_img.shape, rgb.shape)
-                #target = target.permute(2, 1, 0).unsqueeze(0)
-                #fake_img = fake_img.permute(2,1,0).unsqueeze(0)
 
                 D_real = D(real).cuda()
                 D_fake = D(fake).cuda()
@@ -979,15 +973,6 @@ def train():
             masked_patch = torch.reshape(target_s, (32, 32, -1)).permute(2, 1, 0).unsqueeze(0)
             mask = torch.reshape(mask_s, (32, 32, -1)).permute(2,1,0).unsqueeze(0)
             output_patch = torch.reshape(rgb, (32, 32, -1)).permute(2,1,0).unsqueeze(0)
-        #save_image(output_patch[0], "NeRF_Patch.png")
-        #print(mask.shape, masked_patch.shape, output_patch.shape)
-        
-        #fake_img = target
-        #for c in range(N_rand):
-            #fake_img[select_coords[c][0]][select_coords[c][1]] = rgb[c]
-        #print(fake_img.shape, rgb.shape)
-        #fake_img = fake_img.permute(2,1,0).unsqueeze(0)
-
 
             D_fake = D(output_patch*(1-mask) + masked_patch * mask) #[0~1]
 
@@ -995,14 +980,10 @@ def train():
         optimizer.zero_grad()
         
         if args.prior:
-            #print("Using prior")
-            # Suppose patch didn't have mask region
-            # D_fake.mean() should be 1
-            # loss = img2mse(rgb, target_s) - 1
-            # suppose 
+            
             if i >= 0:
+                print("Fine mse loss + Discriminator_loss")
                 img_loss = img2mse(rgb * mask_s, target_s) - 0.01 * D_fake.mean()
-                print("Using Discriminator_Loss")
             else:
                 img_loss = img2mse(rgb * mask_s, target_s)
         else:
@@ -1014,7 +995,8 @@ def train():
         psnr = mse2psnr(img_loss)
 
         if 'rgb0' in extras:
-            img_loss0 = img2mse(extras['rgb0'], target_s)
+            print("Coarse mse loss")
+            img_loss0 = img2mse(extras['rgb0'] * mask_s, target_s)
             loss = loss + img_loss0
             psnr0 = mse2psnr(img_loss0)
 

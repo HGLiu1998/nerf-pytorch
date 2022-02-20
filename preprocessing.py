@@ -27,7 +27,7 @@ toTensor = tranforms.Compose([
     tranforms.ToTensor(),
 ])
 
-scale = transforms.Compose([
+scaling = transforms.Compose([
     transforms.Resize((512, 512))
 ])
 
@@ -61,7 +61,7 @@ def preprocessing(imgs, datadir, using_mask=True, scale=False):
                 m_img = Image.open(mask_imgs[i])
                 m_img = toTensor(m_img).cuda()
                 if scale:
-                    m_img = scale(m_img)
+                    m_img = scaling(m_img)
                 #mask = m_img[:3, :, :]
                 for n in range(m_img.shape[1]):
                     for m in range(m_img.shape[2]):

@@ -117,7 +117,7 @@ class CoordConv(nn.Module):
         super(CoordConv, self).__init__()
         self.addcoords = AddCoords(with_r=with_r)
         in_c = in_c + 3 if with_r else in_c + 2
-        self.conv = torch.Conv2d(in_c, out_c, **kwargs)
+        self.conv = nn.Conv2d(in_c, out_c, **kwargs)
 
     def forward(self, x):
         ret = self.addcoords(x)
@@ -126,6 +126,7 @@ class CoordConv(nn.Module):
 
 class ResidualCoordConv(nn.Module):
     def __init__(self, in_c, out_c, kernel_size=3, stride=1, downsample=False):
+        super(ResidualCoordConv, self).__init__()
         p = kernel_size // 2
         self.network = nn.Sequential(
             CoordConv(in_c, out_c, kernel_size=kernel_size, stride=stride, padding=p),
@@ -133,7 +134,7 @@ class ResidualCoordConv(nn.Module):
             CoordConv(out_c, out_c, kernel_size=kernel_size, padding=p),
             nn.LeakyReLU(0.2, inplace=True),
         )
-        torch.nn.init.kaiming_normal_(self.network.weight, a=0.2, mode='fan_in', nonlinearity='leaky_relu')
+        #torch.nn.init.kaiming_normal_(self.network.weight, a=0.2, mode='fan_in', nonlinearity='leaky_relu')
         self.proj = nn.Conv2d(in_c, out_c, 1) if in_c != out_c else None
         self.downsample = downsample
 
